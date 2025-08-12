@@ -1,269 +1,242 @@
 
+import os
+import time
+import math
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-
-# Auto-refresh every 5 seconds
-st_autorefresh(interval=5000, key='refresh')
-
-# --- Competition Welcome Banner ---
-st.set_page_config(page_title='TPPR AI Safety Assistant', layout='wide')
-st.title('🚨 TPPR AI Safety Assistant')
-st.markdown('''
-**Purpose:** This dashboard simulates an AI-enhanced safety assistant for the Honeywell Touchpoint Pro gas detection system. It demonstrates how AI can provide real-time monitoring, anomaly detection, and safety recommendations to protect workers in hazardous gas environments.
-
-**Features:**
-- Live simulation of gas detection channels
-- AI-driven anomaly alerts
-- Clear visualizations for quick decision-making
-
-_Developed for innovation competitions to showcase AI integration in industrial safety._
-''')
-
-# --- Live AI Alert Panel ---
-import numpy as np
-    alert_placeholder.success('✅ All clear: Gas levels within safe range.')
-
 import pandas as pd
 import numpy as np
-import time
-from datetime import datetime
 import matplotlib.pyplot as plt
 
-# Load dataset
-DF_PATH = "/mnt/data/tppr_simulated.csv"
-import os
-csv_path = os.path.join(os.path.dirname(__file__), "tppr_simulated.csv")
-if not os.path.exists(csv_path):
-    raise FileNotFoundError(f"CSV file not found at {csv_path}")
-df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+# Auto-refresh every 5 seconds (keeps dashboard "live" for judges)
+try:
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=5000, key="auto_refresh")
+except Exception:
+    # If package missing, ignore auto-refresh (app still works)
+    pass
 
-# --- Live AI Alert Panel with Slider ---
-danger_threshold = st.slider('Set danger threshold (ppm):', min_value=0, max_value=200, value=50, step=1)
-latest_readings = df.tail(1)
-alert_placeholder = st.empty()
-import numpy as np
-if (latest_readings.select_dtypes(include=[np.number]) > danger_threshold).any().any():
-    alert_placeholder.error(f'🚨 **DANGER:** High gas levels detected! Above {danger_threshold} ppm. Immediate action required!')
-    alert_placeholder.success(f'✅ All clear: Gas levels within safe range (≤ {danger_threshold} ppm).')
+st.set_page_config(page_title='TPPR AI Safety Assistant', layout='wide')
 
-# --- Alert History Sidebar ---
+st.title("🚨 TPPR AI Safety Assistant")
+st.markdown(
+    """
+    **Purpose:** Demo of an AI layer that augments Honeywell Touchpoint Pro data with anomaly detection,
+    short-term forecasting, alert ranking, and an interactive operator dashboard.
+    """
+)
+
+# Determine CSV path reliably
+CSV_NAME = "tppr_simulated.csv"
+CSV_PATH = os.path.join(os.path.dirname(__file__), CSV_NAME)
+
+# Load CSV if present, otherwise generate a realistic fallback dataset
+if os.path.exists(CSV_PATH):
+    df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
+else:
+    # Fallback synthetic dataset
+    now = pd.Timestamp("2025-08-12 14:00:00")
+    minutes = 240  # 4 hours
+    rows = []
+    channels = [
+        {"id": 1, "gas": "CH4", "threshold": 100},
+        {"id": 2, "gas": "H2S", "threshold": 50},
+        {"id": 3, "gas": "CO", "threshold": 200},
+    ]
+    np.random.seed(42)
+    for i in range(minutes):
+        ts = now + pd.Timedelta(minutes=i)
+        for ch in channels:
+            baseline = {"CH4": 25, "H2S": 5, "CO": 2}[ch["gas"]]
+            value = baseline + np.random.normal(0, baseline*0.05)
+            rows.append({
+                "timestamp": ts,
+                "channel": ch["id"],
+                "gas_type": ch["gas"],
+                "gas_level_ppm": round(float(value), 2),
+                "alarm_state": 0,
+                "fault_state": 0,
+                "sensor_status": "OK",
+                "calibration_date": "2025-06-10"
+            })
+    df = pd.DataFrame(rows)
+    # inject a slow ramp leak on CH4 and some spikes for demo
+    def apply_ramp(df, ch_id, start_min, dur, peak):
+        mask = (df['channel']==ch_id)
+        idxs = df[mask].index[start_min:start_min+dur]
+        for i, idx in enumerate(idxs):
+            df.at[idx, 'gas_level_ppm'] += (i/len(idxs))*peak
+    apply_ramp(df, 1, 60, 40, 120)
+    # inject spikes
+    for m in [30, 90, 150]:
+        row = df[(df['channel']==1)].iloc[m:m+1]
+        if not row.empty:
+            idx = row.index[0]
+            df.at[idx, 'gas_level_ppm'] += 80
+    # set alarm states where threshold exceeded
+    thresholds = {1:100, 2:50, 3:200}
+    for ch_id, thr in thresholds.items():
+        ch_mask = df['channel']==ch_id
+        df.loc[ch_mask & (df['gas_level_ppm'] >= thr), 'alarm_state'] = 1
+
+# Ensure timestamp dtype
+if df['timestamp'].dtype == object:
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+# Sidebar controls
+st.sidebar.header("Controls")
+danger_threshold = st.sidebar.slider('Danger threshold (ppm)', min_value=0, max_value=500, value=50, step=1)
+play_live_feed = st.sidebar.button("▶ Start Live Feed Simulation")
+speed = st.sidebar.selectbox("Feed speed (delay sec per step)", [0.1, 0.25, 0.5, 1.0], index=1)
+
+# Prepare layout
+col_main, col_side = st.columns([3,1])
+
+# Alert history initialization
 if 'alert_history' not in st.session_state:
     st.session_state.alert_history = []
 
-latest_time = latest_readings['timestamp'].iloc[0] if 'timestamp' in latest_readings else 'Unknown time'
-if (latest_readings.select_dtypes(include=[np.number]) > danger_threshold).any().any():
-    st.session_state.alert_history.append(f"🚨 Danger at {latest_time} — Gas above {danger_threshold} ppm")
-    st.session_state.alert_history.append(f"✅ Safe at {latest_time} — Gas within safe range")
+# Current latest readings
+latest_readings = df.tail(1)
 
-st.sidebar.title('Alert History')
-for alert in reversed(st.session_state.alert_history[-20:]):  # Show last 20 events
-    st.sidebar.write(alert)
+# Live AI Alert panel
+with col_side:
+    alert_placeholder = st.empty()
+    numeric_latest = latest_readings.select_dtypes(include=[np.number])
+    is_danger = False
+    if not numeric_latest.empty and (numeric_latest > danger_threshold).any().any():
+        is_danger = True
+        alert_placeholder.error(f"🚨 DANGER: Gas above {danger_threshold} ppm detected!")
+    else:
+        alert_placeholder.success(f"✅ All clear (≤ {danger_threshold} ppm)")
 
+    # Update alert history
+    latest_time = latest_readings['timestamp'].iloc[0] if 'timestamp' in latest_readings else 'Unknown time'
+    if is_danger:
+        st.session_state.alert_history.append(f"🚨 {latest_time} — Gas > {danger_threshold} ppm")
+    else:
+        st.session_state.alert_history.append(f"✅ {latest_time} — Safe")
 
-st.set_page_config(page_title="TPPR AI Demo", layout="wide")
+    st.sidebar.title("Alert History (most recent)")
+    for item in reversed(st.session_state.alert_history[-20:]):
+        st.sidebar.write(item)
 
-st.title("TPPR AI Safety Assistant — Live Simulation")
-st.markdown("Simulated TPPR data playback with onboard AI anomaly detection and alert ranking.")
+# Main charts area
+with col_main:
+    st.subheader("Channel Readings & Forecasts")
+    channels = sorted(df['channel'].unique())
+    channel_map = {1: "CH4 (methane)", 2: "H2S", 3: "CO"}
+    thresholds = {1:100, 2:50, 3:200}
 
-# Sidebar controls
-st.sidebar.header("Playback Controls")
-speed = st.sidebar.selectbox("Playback speed", options=["0.5x", "1x", "2x", "5x"], index=1)
-speed_map = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0, "5x": 5.0}
-speed_factor = speed_map[speed]
-play = st.sidebar.checkbox("Play", value=False)
+    # Play live feed if requested
+    if play_live_feed:
+        for i in range(len(df)):
+            snapshot = df.iloc[:i+1].copy()
+            # create small plotting area
+            fig, axs = plt.subplots(len(channels), 1, figsize=(10, 3*len(channels)), sharex=True)
+            forecasts = []
+            for j, ch in enumerate(channels):
+                ch_data = snapshot[snapshot['channel']==ch].copy()
+                ch_data = ch_data.set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
+                series = ch_data['gas_level_ppm']
+                axs[j].plot(series.index, series.values, label='Measured')
+                axs[j].set_ylabel("ppm")
+                # mark TPPR alarms
+                alarm_points = series[series >= thresholds[ch]]
+                if not alarm_points.empty:
+                    axs[j].scatter(alarm_points.index, alarm_points.values, marker='x', color='red', zorder=5)
+                # anomaly detection (simple z-score)
+                is_anom = False
+                if len(series) >= 5:
+                    window = min(12, len(series))
+                    recent = series.iloc[-window:]
+                    mean = recent.mean()
+                    std = recent.std(ddof=0)
+                    if std > 0:
+                        z = (series.iloc[-1] - mean) / std
+                        if abs(z) >= 3.0:
+                            is_anom = True
+                            axs[j].axvline(series.index[-1], color='orange', linestyle='--', alpha=0.6)
+                # forecast: linear fit on last up to 20 samples
+                try:
+                    recent = series.dropna().iloc[-20:]
+                    if len(recent) >= 3:
+                        x = np.arange(len(recent))
+                        y = recent.values.astype(float)
+                        coef = np.polyfit(x, y, 1)
+                        m, b = coef[0], coef[1]
+                        future_x = np.arange(len(recent), len(recent)+5)
+                        future_y = m*future_x + b
+                        last_time = series.index[-1]
+                        future_index = [last_time + pd.Timedelta(minutes=int(k)) for k in range(1,6)]
+                        axs[j].plot(future_index, future_y, linestyle='--', marker='o', label='Predicted')
+                        forecasts.append((ch, channel_map.get(ch, str(ch)), future_index, future_y))
+                except Exception:
+                    pass
+                axs[j].legend(loc='upper left')
+            st.pyplot(fig)
+            # show forecast table if available
+            if forecasts:
+                rows = []
+                for f in forecasts:
+                    for t, v in zip(f[2], f[3]):
+                        rows.append({'channel': f[0], 'gas': f[1], 'pred_time': t, 'pred_ppm': round(float(v),2)})
+                st.write("**Short-term per-channel forecast (next 5 minutes)**")
+                st.dataframe(pd.DataFrame(rows))
+            time.sleep(speed)
+        st.experimental_rerun()
 
-st.sidebar.header("AI Settings")
-window = st.sidebar.slider("Rolling window (minutes) for baseline", min_value=3, max_value=30, value=12)
-z_threshold = st.sidebar.slider("Anomaly z-score threshold", min_value=1.0, max_value=5.0, value=3.0, step=0.5)
-ranking_sensitivity = st.sidebar.slider("Ranking sensitivity (slope multiplier)", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-
-# Channels
-channels = df['channel'].unique().tolist()
-channel_map = {1: "CH4 (methane)", 2: "H2S", 3: "CO"}
-thresholds = {1: 100, 2: 50, 3: 200}
-
-# Playback state
-if "pos" not in st.session_state:
-    st.session_state.pos = 0
-
-rows = df.shape[0]
-step_seconds = 1.0 / speed_factor  # how fast to iterate (1 second per simulated minute / speed)
-
-col1, col2 = st.columns([2,1])
-
-with col2:
-    st.subheader("Active Alerts")
-    alert_table = st.empty()
-    st.subheader("TPPR vs AI")
-    status_box = st.empty()
-
-with col1:
-    st.subheader("Channel Readings")
-    chart_area = st.empty()
-    st.subheader("Timeline (current minute)")
-    timeline_area = st.empty()
-
-# Helper: compute rolling z-score anomaly per channel
-def detect_anomaly(series, window, z_thresh):
-    if len(series) < window+1:
-        return False, 0.0, 0.0
-    recent = series[-window:]
-    mean = np.mean(recent)
-    std = np.std(recent, ddof=0)
-    if std == 0:
-        return False, 0.0, 0.0
-    last = series.iloc[-1]
-    z = (last - mean) / std
-    return (abs(z) >= z_thresh), float(z), float(mean)
-
-# Simple slope-based time-to-threshold estimate
-def time_to_threshold(series, threshold):
-    # use last N points to compute slope (minutes)
-    if len(series) < 3:
-        return None, 0.0
-    x = np.arange(len(series))
-    y = series.values
-    # linear fit
-    A = np.vstack([x, np.ones_like(x)]).T
-    m, c = np.linalg.lstsq(A, y, rcond=None)[0]
-    if m <= 0:
-        return None, m  # not increasing
-    # estimate minutes until threshold
-    last = y[-1]
-    minutes = (threshold - last) / m
-    return max(minutes, 0.0), m
-
-# Playback loop - driven by Play control
-def render_at_index(idx):
-    # prepare snapshot up to idx
-    snapshot = df.iloc[:idx+1].copy()
-    latest = snapshot.tail(len(channels))
-    # Build per-channel series for plotting
+    # Non-playback (static view of latest snapshot)
+    snapshot = df.copy()
+    latest_snapshot = snapshot.tail(len(channels)*4)  # recent chunk
     fig, axs = plt.subplots(len(channels), 1, figsize=(10, 3*len(channels)), sharex=True)
-    ai_alerts = []
-    ai_alerts_rows = []
-    tppr_alarm_rows = []
     forecasts = []
-    for i, ch in enumerate(channels):
+    for j, ch in enumerate(channels):
         ch_data = snapshot[snapshot['channel']==ch].copy()
         ch_data = ch_data.set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
         series = ch_data['gas_level_ppm']
-        axs[i].plot(series.index, series.values)
-        axs[i].set_title(f"Channel {ch} — {series.name if series.name else ''} {('('+str(ch)+')') if True else ''} — Threshold {thresholds[ch]} ppm")
-        axs[i].set_ylabel("ppm")
-
-        # --- Per-channel short-term forecast (linear regression on recent values) ---
-        try:
-            # Prepare numeric series for forecasting: use last up to 20 samples
-            recent = series.dropna().iloc[-20:]
-            if len(recent) >= 3:
-                # x as minutes index 0..n-1
-                x = np.arange(len(recent))
-                y = recent.values.astype(float)
-                # linear fit (degree 1)
-                coef = np.polyfit(x, y, 1)
-                m, b = coef[0], coef[1]
-                # predict next 5 points
-                future_x = np.arange(len(recent), len(recent)+5)
-                future_y = m * future_x + b
-                # Create datetime index for future
-                last_time = series.index[-1]
-                future_index = [last_time + pd.Timedelta(minutes=int(i)) for i in range(1,6)]
-                # Plot predicted values
-                axs[i].plot(future_index, future_y, linestyle='--', marker='o', label='Predicted', alpha=0.9)
-                axs[i].legend()
-                # Collect forecast for table
-                forecasts.append({
-                    'channel': ch,
-                    'gas': channel_map.get(ch, str(ch)),
-                    'pred_times': [t.strftime('%Y-%m-%d %H:%M:%S') for t in future_index],
-                    'pred_values': [round(float(v),2) for v in future_y]
-                })
-        except Exception as _e:
-            # If forecasting fails for this channel, skip it quietly
-            pass
-
-        # mark TPPR alarm points
+        axs[j].plot(series.index, series.values, label='Measured')
+        axs[j].set_ylabel("ppm")
         alarm_points = series[series >= thresholds[ch]]
         if not alarm_points.empty:
-            axs[i].scatter(alarm_points.index, alarm_points.values, marker='x')
-        # AI anomaly detection using rolling window of last 'window' minutes
-        is_anom, zscore, mean = detect_anomaly(series, window, z_threshold)
-        t2t, slope = time_to_threshold(series.tail(max(window,5)), thresholds[ch])
-        urgency = 0.0
-        if is_anom:
-            # severity score = zscore * (1 + slope * ranking_sensitivity)
-            urgency = abs(zscore) * (1 + max(0.0, slope) * ranking_sensitivity)
-            ai_alerts.append({
-                "channel": ch,
-                "gas": channel_map.get(ch, str(ch)),
-                "latest_ppm": float(series.iloc[-1]),
-                "zscore": round(zscore,2),
-                "slope": round(slope,3),
-                "minutes_to_threshold": None if t2t is None else round(t2t,1),
-                "urgency": round(urgency,3)
-            })
-            ai_alerts_rows.append([channel_map.get(ch, str(ch)), series.index[-1].strftime("%Y-%m-%d %H:%M:%S"), round(series.iloc[-1],2), round(zscore,2), None if t2t is None else round(t2t,1), round(urgency,3)])
-        # TPPR alarm detection (simulated)
-        tppr_alarm = df[(df['channel']==ch) & (df['alarm_state']==1) & (df.index <= idx)]
-        if not tppr_alarm.empty:
-            last_alarm = tppr_alarm.iloc[-1]
-            tppr_alarm_rows.append([channel_map.get(ch, str(ch)), last_alarm['timestamp'], round(last_alarm['gas_level_ppm'],2)])
-    # Display chart
-    chart_area.pyplot(fig)
-    # Update alerts table and TPPR status
-    if ai_alerts:
-        alerts_df = pd.DataFrame(ai_alerts).sort_values("urgency", ascending=False)
-        alert_table.table(alerts_df[['channel','gas','latest_ppm','zscore','minutes_to_threshold','urgency']])
-        alert_table.markdown("**No AI alerts** — system nominal.")
+            axs[j].scatter(alarm_points.index, alarm_points.values, marker='x', color='red', zorder=5)
+        # anomaly detection
+        if len(series) >= 5:
+            window = min(12, len(series))
+            recent = series.iloc[-window:]
+            mean = recent.mean()
+            std = recent.std(ddof=0)
+            if std > 0:
+                z = (series.iloc[-1] - mean) / std
+                if abs(z) >= 3.0:
+                    axs[j].axvline(series.index[-1], color='orange', linestyle='--', alpha=0.6)
+        # forecast per-channel
+        try:
+            recent = series.dropna().iloc[-20:]
+            if len(recent) >= 3:
+                x = np.arange(len(recent))
+                y = recent.values.astype(float)
+                coef = np.polyfit(x, y, 1)
+                m, b = coef[0], coef[1]
+                future_x = np.arange(len(recent), len(recent)+5)
+                future_y = m*future_x + b
+                last_time = series.index[-1]
+                future_index = [last_time + pd.Timedelta(minutes=int(k)) for k in range(1,6)]
+                axs[j].plot(future_index, future_y, linestyle='--', marker='o', label='Predicted')
+                forecasts.append((ch, channel_map.get(ch, str(ch)), future_index, future_y))
+        except Exception:
+            pass
+        axs[j].legend(loc='upper left')
+    st.pyplot(fig)
+    if forecasts:
+        rows = []
+        for f in forecasts:
+            for t, v in zip(f[2], f[3]):
+                rows.append({'channel': f[0], 'gas': f[1], 'pred_time': t, 'pred_ppm': round(float(v),2)})
+        st.write("**Short-term per-channel forecast (next 5 minutes)**")
+        st.dataframe(pd.DataFrame(rows))
 
-    if tppr_alarm_rows:
-        tppr_df = pd.DataFrame(tppr_alarm_rows, columns=["channel","timestamp","ppm"])
-        status_box.table(tppr_df)
-        status_box.markdown("**No TPPR alarms have occurred yet.**")
-
-# Main loop control
-if play:
-    # iterate while Play is checked
-    if st.session_state.pos >= rows-1:
-        st.session_state.pos = 0
-    for i in range(st.session_state.pos, rows):
-        st.session_state.pos = i
-        render_at_index(i)
-        time.sleep(step_seconds)
-        # allow manual break
-        if not st.checkbox("Keep Playing (uncheck to stop)", value=True, key=f"playchk_{i}"):
-            break
-    # show current snapshot at st.session_state.pos
-    render_at_index(st.session_state.pos)
-    # allow stepping
-    col_prev, col_next = st.columns(2)
-    if col_prev.button("<< Back"):
-        st.session_state.pos = max(0, st.session_state.pos - len(channels))
-    if col_next.button("Forward >>"):
-        st.session_state.pos = min(rows-1, st.session_state.pos + len(channels))
-
+# Footer / notes
 st.markdown("---")
-st.write("Simulation time:", df.iloc[st.session_state.pos]['timestamp'])
-
-# --- Alert History Sidebar ---
-if 'alert_history' not in st.session_state:
-    st.session_state.alert_history = []
-
-latest_time = latest_readings['timestamp'].iloc[0] if 'timestamp' in latest_readings else 'Unknown time'
-if (latest_readings.select_dtypes(include=[np.number]) > danger_threshold).any().any():
-    st.session_state.alert_history.append(f"🚨 Danger at {latest_time} — Gas above {danger_threshold} ppm")
-    st.session_state.alert_history.append(f"✅ Safe at {latest_time} — Gas within safe range")
-
-st.sidebar.title('Alert History')
-for alert in reversed(st.session_state.alert_history[-20:]):  # Show last 20 events
-    st.sidebar.write(alert)
-
-# --- Live Feed Simulation ---
-import time
-if st.button('▶ Start Live Feed Simulation'):
-    st.markdown('### Live Sensor Data Feed')
-    feed_placeholder = st.empty()
-    for i in range(len(df)):
-        feed_placeholder.dataframe(df.head(i+1).tail(10))  # Show last 10 readings
-        time.sleep(0.1)
+st.markdown("**Notes:** This demo runs with a simulated dataset if a CSV isn't present. For full integration,"
+            " TPPR would stream Modbus/RS-485 or Modbus/TCP data to the AI unit which would run the same"
+            " analytics shown here.")
