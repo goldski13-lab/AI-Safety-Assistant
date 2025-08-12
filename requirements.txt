@@ -1,7 +1,5 @@
 streamlit
 pandas
-matplotlib
 numpy
-soundfile
-sounddevice
-streamlit-autorefresh
+plotly
+streamlit-plotly-events

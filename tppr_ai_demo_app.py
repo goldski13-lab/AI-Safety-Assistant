@@ -1,249 +1,212 @@
 
-import os, time, io
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
-from datetime import timedelta
-import soundfile as sf
-import sounddevice as sd
+import plotly.graph_objects as go
+from streamlit_plotly_events import plotly_events
+import time, random
 
-st.set_page_config(page_title="TPPR AI Assistant — UX Upgrade", layout="wide")
-st.title("🚨 TPPR AI Safety Assistant — UX Upgrade")
+# Page config
+st.set_page_config(page_title="TPPR AI — 3D Enhanced Lab", layout="wide")
+st.title("TPPR AI Safety Assistant — 3D Enhanced Lab Twin")
 
-# Load or simulate data
-CSV_NAME = "tppr_simulated.csv"
-CSV_PATH = os.path.join(os.path.dirname(__file__), CSV_NAME)
-if os.path.exists(CSV_PATH):
-    df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
-else:
-    now = pd.Timestamp.now().floor('min')
-    minutes = 240
+# Rooms (top-down layout)
+ROOMS = [
+    {"id": "mixing", "name": "Mixing Area",    "x": 0, "y": 0},
+    {"id": "pack",   "name": "Packaging Line", "x": 4, "y": 0},
+    {"id": "boiler", "name": "Boiler Room",    "x": 0, "y": 4},
+    {"id": "waste",  "name": "Waste Treatment","x": 4, "y": 4},
+]
+
+DEFAULT_ROOM_COLOR = "#b3d9ff"  # light blue
+ROOM_COLORS = {r["id"]: DEFAULT_ROOM_COLOR for r in ROOMS}
+
+# Initialize session state
+if "df" not in st.session_state:
+    now = pd.Timestamp.now().floor("min")
     rows = []
-    channels = [{"id":1,"gas":"CH4","thr":100},{"id":2,"gas":"H2S","thr":50},{"id":3,"gas":"CO","thr":200}]
-    np.random.seed(42)
-    for i in range(minutes):
-        ts = now + pd.Timedelta(minutes=i)
-        for ch in channels:
-            base = {"CH4":25,"H2S":5,"CO":2}[ch["gas"]]
-            val = base + np.random.normal(0, base*0.05)
-            rows.append({"timestamp":ts,"channel":ch["id"],"gas_type":ch["gas"],"gas_level_ppm":round(float(val),2),"alarm_state":0})
-    df = pd.DataFrame(rows)
-    # inject demo event
-    def ramp(ch_id,start,dur,peak):
-        mask = df['channel']==ch_id
-        idxs = df[mask].index[start:start+dur]
-        for i,idx in enumerate(idxs):
-            df.at[idx,'gas_level_ppm'] += (i/len(idxs))*peak
-    ramp(1,60,40,120)
-    for m in [30,90,150]:
-        row = df[(df['channel']==1)].iloc[m:m+1]
-        if not row.empty:
-            idx = row.index[0]
-            df.at[idx,'gas_level_ppm'] += 80
-    thr = {1:100,2:50,3:200}
-    for ch, t in thr.items():
-        chmask = df['channel']==ch
-        df.loc[chmask & (df['gas_level_ppm']>=t), 'alarm_state'] = 1
+    for minute in range(120):  # 2 hours baseline
+        ts = now + pd.Timedelta(minutes=minute)
+        for r in ROOMS:
+            base = {"mixing":25,"pack":10,"boiler":5,"waste":8}[r["id"]]
+            val = base + np.random.normal(0, base*0.03)
+            rows.append({"timestamp": ts, "room": r["id"], "ppm": round(float(val),2)})
+    st.session_state.df = pd.DataFrame(rows)
+    st.session_state.selected_room = None
+    st.session_state.room_colors = ROOM_COLORS.copy()
+    st.session_state.sim_history = []
 
-# Ensure timestamp
-if df['timestamp'].dtype == object:
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+df = st.session_state.df
 
-# Sidebar controls (grouped)
-st.sidebar.header("Display Settings")
-thresholds_global = st.sidebar.slider("Global danger threshold (ppm)", 0, 500, 100)
-accessibility = st.sidebar.checkbox("High-contrast (accessibility) mode", value=False)
-st.sidebar.markdown("**Simulation Controls**")
-play = st.sidebar.button("▶ Start Live Feed")
-speed = st.sidebar.selectbox("Feed speed (s per step)", [0.1,0.25,0.5,1.0], index=1)
+# Layout: top metrics row then main columns
+st.markdown("### Live Metrics")
+metric_cols = st.columns(len(ROOMS))
+latest = df.groupby("room").tail(1).set_index("room")['ppm'].to_dict()
+for i, r in enumerate(ROOMS):
+    val = latest.get(r["id"], 0)
+    prev = df[df["room"]==r["id"]].tail(2)
+    delta = ""
+    if len(prev) >= 2:
+        delta = f\"{round(val - prev['ppm'].iloc[0],2)} ppm\"
+    metric_cols[i].metric(label=r["name"], value=f\"{val} ppm\", delta=delta)
 
-channel_map = {1:"CH4 (methane)", 2:"H2S", 3:"CO"}
-thresholds = {1:100, 2:50, 3:200}
+st.markdown("---")
+left, center, right = st.columns([1.2, 2.4, 1.4])
 
-# Latest per-channel values
-latest = df.groupby('channel').tail(1).set_index('channel')
-channel_latest = {ch: float(latest.loc[ch,'gas_level_ppm']) if ch in latest.index else None for ch in sorted(df['channel'].unique())}
+with left:
+    st.header("Controls")
+    if st.button("Simulate Live Gas Event"):
+        # random room and severity
+        room = random.choice(ROOMS)
+        severity = random.choices(["warning","critical"], weights=[0.6,0.4])[0]
+        dur = 6 if severity=="warning" else 12
+        peak = 80 if severity=="warning" else 160
+        last_ts = st.session_state.df['timestamp'].max()
+        start = last_ts + pd.Timedelta(minutes=1)
+        new_rows = []
+        for i in range(dur):
+            ts = start + pd.Timedelta(minutes=i)
+            for rr in ROOMS:
+                base = {"mixing":25,"pack":10,"boiler":5,"waste":8}[rr["id"]]
+                val = base + np.random.normal(0, base*0.03)
+                if rr["id"] == room["id"]:
+                    val += (i/dur)*peak + np.random.normal(0,5)
+                new_rows.append({"timestamp": ts, "room": rr["id"], "ppm": round(float(val),2)})
+        st.session_state.df = pd.concat([st.session_state.df, pd.DataFrame(new_rows)], ignore_index=True)
+        # set glow color and record in history
+        glow = "#ffb84d" if severity=="warning" else "#ff4c4c"
+        st.session_state.room_colors[room["id"]] = glow
+        st.session_state.selected_room = room["id"]
+        st.session_state.sim_history.append({"time": pd.Timestamp.now(), "room": room["id"], "severity": severity})
+        # rerun so plot updates and we show zoom
+        st.experimental_rerun()
 
-# Compute per-channel status
-per_status = {}
-worst_status = ('safe', 0, None)
-for ch, val in channel_latest.items():
-    thr = thresholds.get(ch, thresholds_global)
-    if val is None:
-        st = ('nodata', 0)
-    else:
-        pct = val / thr if thr>0 else 0
-        if val >= thr:
-            st = ('critical', pct)
-        elif pct >= 0.75:
-            st = ('warning', pct)
-        else:
-            st = ('safe', pct)
-    per_status[ch] = {'value': val, 'status': st[0], 'pct': round(float(st[1]),2), 'threshold': thr}
-    if st[1] > worst_status[1]:
-        worst_status = (st[0], st[1], ch)
+    if st.button("Reset Simulation Data"):
+        # clear and recreate baseline
+        st.session_state.clear()
+        st.experimental_rerun()
 
-# Top banner
-overall = worst_status[0]
-if overall == 'critical':
-    st.markdown(f"<div style='background:#ff4c4c;padding:12px;border-radius:8px;color:white'><h2>🚨 CRITICAL — {channel_map.get(worst_status[2])} {per_status[worst_status[2]]['value']} ppm (≥ {per_status[worst_status[2]]['threshold']} ppm)</h2></div>", unsafe_allow_html=True)
-    sound = True
-elif overall == 'warning':
-    st.markdown(f"<div style='background:#ffb84d;padding:12px;border-radius:8px;color:#3a2d0f'><h2>🟠 WARNING — {channel_map.get(worst_status[2])} {per_status[worst_status[2]]['value']} ppm (close to {per_status[worst_status[2]]['threshold']} ppm)</h2></div>", unsafe_allow_html=True)
-    sound = False
+    st.markdown("**Simulation history** (most recent first)")
+    hist = list(reversed(st.session_state.sim_history[-10:]))
+    for h in hist:
+        st.write(f\"- {h['time'].strftime('%H:%M:%S')} — {h['room']} — {h['severity']}\")
+
+    st.markdown("---")
+    st.write("Tips: Click a room on the 3D floorplan to zoom in and inspect detector predictions. Click again to zoom out.")
+
+# Build 3D floorplan as simple boxes + invisible scatter markers for clicks
+mesh_traces = []
+marker_x = []
+marker_y = []
+marker_z = []
+marker_text = []
+marker_room_ids = []
+
+for r in ROOMS:
+    x0, y0 = r["x"], r["y"]
+    size = 2.0
+    # vertices for a flat box with slight height
+    vx = [x0, x0+size, x0+size, x0, x0, x0+size, x0+size, x0]
+    vy = [y0, y0, y0+size, y0+size, y0, y0, y0+size, y0+size]
+    vz = [0,0,0,0,0.6,0.6,0.6,0.6]
+    faces = [[0,1,2],[0,2,3],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]]
+    i,j,k = zip(*faces)
+    mesh_traces.append(go.Mesh3d(x=vx, y=vy, z=vz, i=i, j=j, k=k, color=st.session_state.room_colors[r["id"]], opacity=0.9, name=r["name"], hovertext=r["name"], hoverinfo="text"))
+    # place a small invisible scatter marker at the center to capture clicks
+    cx = x0 + size/2; cy = y0 + size/2; cz = 0.3
+    marker_x.append(cx); marker_y.append(cy); marker_z.append(cz)
+    marker_text.append(r["name"])
+    marker_room_ids.append(r["id"])
+
+marker_trace = go.Scatter3d(x=marker_x, y=marker_y, z=marker_z, mode='markers+text',
+                            marker=dict(size=6, color='rgba(0,0,0,0)'), text=marker_text, textposition="top center",
+                            hoverinfo='text')
+fig = go.Figure(data=mesh_traces + [marker_trace])
+# camera zoom settings
+def camera_for_room(room_id):
+    r = next(rr for rr in ROOMS if rr["id"]==room_id)
+    return dict(eye=dict(x=r["x"]+3.5, y=r["y"]+3.5, z=2.5), center=dict(x=r["x"]+1, y=r["y"]+1, z=0.25))
+
+camera = None
+if st.session_state.selected_room:
+    camera = camera_for_room(st.session_state.selected_room)
 else:
-    st.markdown(f"<div style='background:#d4f0d4;padding:12px;border-radius:8px;color:#0f3a14'><h2>✅ SAFE — All channels within normal range</h2></div>", unsafe_allow_html=True)
-    sound = False
+    camera = dict(eye=dict(x=6, y=6, z=6))
 
-# Play short beep for critical (using embedded WAV bytes if available)
-if overall == 'critical':
-    # generate a short sine beep and provide as downloadable audio and play via st.audio
-    sr = 22050
-    t = np.linspace(0,0.4,int(sr*0.4), False)
-    freq = 880.0
-    sine = 0.5*np.sin(2*np.pi*freq*t)
-    # convert to 16-bit PCM bytes
-    import soundfile as sf, io
-    buf = io.BytesIO()
-    sf.write(buf, sine, sr, format='WAV')
-    buf.seek(0)
-    st.audio(buf.read())
+fig.update_layout(scene=dict(xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False)),
+                  height=560, scene_camera=camera, margin=dict(l=0,r=0,t=0,b=0))
 
-# Per-channel metric cards
-cols = st.columns(len(per_status))
-for i, ch in enumerate(sorted(per_status.keys())):
-    p = per_status[ch]
-    val = p['value'] if p['value'] is not None else '—'
-    label = channel_map.get(ch, str(ch))
-    delta = 0
-    try:
-        # compute delta vs previous 1-min
-        prev = df[(df['channel']==ch)].tail(2)['gas_level_ppm'].iloc[0]
-        delta = round(p['value'] - prev,2) if p['value'] is not None else 0
-    except Exception:
-        delta = 0
-    cols[i].metric(label, f\"{val} ppm\", delta= f\"{delta} ppm\" if delta!=0 else \"—\")
-    # small status text
-    cols[i].markdown(f\"**Status:** {p['status'].upper()} (Threshold {p['threshold']} ppm)\")
+with center:
+    st.subheader("3D Floorplan — Click a room to inspect")
+    # capture clicks from the invisible marker scatter (pointNumber corresponds to index in marker arrays)
+    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False)
+    st.plotly_chart(fig, use_container_width=True)
 
-# Help / guided tour
-with st.expander(\"Quick guided tour (recommended for non-experts)\", expanded=False):
-    st.write(\"1. Top banner shows immediate overall AI assessment.\\n2. Metric cards show each gas numeric value and trend.\\n3. Charts below show history + predictions.\\n4. Use the slider and live feed to simulate behaviour.\")
+# Handle clicks
+if clicked and isinstance(clicked, list) and len(clicked)>0:
+    pt = clicked[0]
+    idx = pt.get('pointNumber', None)
+    # marker pointNumber refers to index in the combined data traces; our marker is last trace
+    if idx is not None:
+        # When clicking Mesh3d elements, Plotly returns different indices; handle by mapping to marker trace
+        # We will use customdata via text match based approach when available; else use nearest by coords
+        # Here plotly_events gives 'curveNumber' and 'pointNumber'
+        curve = pt.get('curveNumber', None)
+        pnum = pt.get('pointNumber', None)
+        # Our marker trace is the last trace (index len(mesh_traces))
+        marker_curve_idx = len(mesh_traces)
+        if curve == marker_curve_idx:
+            room_id = marker_room_ids[pnum]
+            # toggle selection: if same room clicked twice -> deselect
+            if st.session_state.selected_room == room_id:
+                st.session_state.selected_room = None
+            else:
+                st.session_state.selected_room = room_id
+            st.experimental_rerun()
 
-# Action guidance box
-if overall in ['critical','warning']:
-    st.markdown(\"### Recommended actions\")
-    if overall == 'critical':
-        st.warning(\"Immediate actions: 1) Evacuate affected area. 2) Isolate main valve. 3) Notify safety officer.\\nPress 'Acknowledge' when done.\")
+# Right panel: room info & mini-forecast chart
+with right:
+    sel = st.session_state.selected_room
+    if sel is None:
+        st.header("Inspector")
+        st.write("Click a room to inspect its detector readings and short-term forecast.")
     else:
-        st.info(\"Precautionary actions: Check ventilation, inspect nearby equipment, stand by.\")
-    op = st.text_input(\"Operator name (optional, to log acknowledgement)\", value=\"\")
-    ack = st.button(\"Acknowledge\")
-    if ack:
-        if 'ack_log' not in st.session_state:
-            st.session_state.ack_log = []
-        st.session_state.ack_log.append({'time':pd.Timestamp.now(), 'operator':op, 'status':overall, 'channel': worst_status[2]})
-        st.success(\"Acknowledged and logged.\")
-
-# Main plotting area
-st.markdown(\"---\")
-st.subheader(\"Channel trends and forecasts\")
-# choose channels to show
-show = st.multiselect(\"Select channels to display\", options=sorted(df['channel'].unique()), default=sorted(df['channel'].unique()), format_func=lambda x: channel_map.get(x, str(x)))
-display_df = df[df['channel'].isin(show)].copy()
-
-# Aggregate for heatmap / alert history visualization
-display_df['hour'] = display_df['timestamp'].dt.floor('H')
-alert_counts = display_df[display_df['alarm_state']==1].groupby(['hour','channel']).size().unstack(fill_value=0)
-
-# Heatmap of alerts per hour
-st.markdown(\"#### Alert heatmap (alerts per hour)\")
-if not alert_counts.empty:
-    fig_h, axh = plt.subplots(figsize=(8,2))
-    im = axh.imshow(alert_counts.T, aspect='auto', cmap='Reds')
-    axh.set_yticks(np.arange(len(alert_counts.columns)))
-    axh.set_yticklabels([channel_map.get(c) for c in alert_counts.columns])
-    axh.set_xticks(np.arange(len(alert_counts.index)))
-    axh.set_xticklabels([t.strftime('%H:%M') for t in alert_counts.index], rotation=45)
-    plt.tight_layout()
-    st.pyplot(fig_h)
-else:
-    st.write(\"No alarms in selected range.\")
-
-# For each channel, plot recent trend and short forecast
-for ch in show:
-    ch_data = display_df[display_df['channel']==ch].set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
-    if ch_data.empty:
-        continue
-    series = ch_data['gas_level_ppm']
-    fig, ax = plt.subplots(figsize=(8,2.5))
-    ax.plot(series.index, series.values, label='Measured')
-    # shaded zones
-    thr = thresholds.get(ch, thresholds_global)
-    ax.fill_between(series.index, thr*0.75, thr, color='orange', alpha=0.1, label='Warning zone')
-    ax.fill_between(series.index, thr, thr*2, color='red', alpha=0.06, label='Critical zone')
-    # anomaly markers
-    if len(series) >= 5:
-        window = min(12, len(series))
-        recent = series.iloc[-window:]
-        m = recent.mean(); s = recent.std(ddof=0)
-        if s > 0 and abs(series.iloc[-1]-m)/s >= 3.0:
-            ax.axvline(series.index[-1], color='purple', linestyle='--', label='Anomaly')
-    # forecast linear
-    try:
-        recent = series.dropna().iloc[-20:]
+        room = next(r for r in ROOMS if r["id"]==sel)
+        st.header(f"Room: {room['name']}")
+        room_df = st.session_state.df[st.session_state.df['room']==sel].sort_values('timestamp')
+        latest = room_df['ppm'].iloc[-1]
+        prev = room_df['ppm'].iloc[-2] if len(room_df)>=2 else latest
+        st.metric(label="Current ppm", value=f\"{latest} ppm\", delta=f\"{round(latest-prev,2)} ppm\")
+        # mini forecast chart using last 20 samples
+        recent = room_df['ppm'].dropna().iloc[-20:]
         if len(recent) >= 3:
-            x = np.arange(len(recent)); y = recent.values.astype(float)
-            coef = np.polyfit(x,y,1); m,b = coef[0],coef[1]
+            x = np.arange(len(recent))
+            y = recent.values.astype(float)
+            coef = np.polyfit(x,y,1)
+            m,b = coef[0],coef[1]
             future_x = np.arange(len(recent), len(recent)+5)
             future_y = m*future_x + b
-            last_t = series.index[-1]
-            future_idx = [last_t + pd.Timedelta(minutes=int(k)) for k in range(1,6)]
-            ax.plot(future_idx, future_y, linestyle='--', marker='o', label='Predicted')
-            # calculate minutes to threshold estimate
-            if m>0:
-                mins_to_thr = (thresholds.get(ch, thresholds_global) - series.iloc[-1]) / m
-            else:
-                mins_to_thr = None
+            import plotly.express as px
+            hist_times = room_df['timestamp'].iloc[-len(recent):]
+            df_plot = pd.DataFrame({"time": list(hist_times) + [hist_times.iloc[-1] + pd.Timedelta(minutes=i) for i in range(1,6)],
+                                    "ppm": list(recent.values) + list(future_y),
+                                    "type": ["measured"]*len(recent) + ["predicted"]*5})
+            fig_mini = px.line(df_plot, x="time", y="ppm", color="type", markers=True, title="Short-term forecast")
+            fig_mini.update_layout(height=250, margin=dict(l=0,r=0,t=30,b=0))
+            st.plotly_chart(fig_mini, use_container_width=True)
         else:
-            mins_to_thr = None
-    except Exception:
-        mins_to_thr = None
-    ax.set_title(f\"{channel_map.get(ch)} — {series.iloc[-1]:.1f} ppm\" )
-    ax.set_ylabel('ppm')
-    ax.legend(loc='upper left', fontsize=8)
-    st.pyplot(fig)
-    if mins_to_thr is not None and mins_to_thr>0 and mins_to_thr<9999:
-        st.write(f\"Estimated time to threshold: ~{max(0,int(round(mins_to_thr)))} minutes (approx)\")
+            st.write("Not enough data for forecast yet.")
 
-# Export PDF report of current figures & alert history
-st.markdown('---')
-st.subheader('Export / Report')
-buffer = io.BytesIO()
-with PdfPages(buffer) as pdf:
-    # simple: write a page with metrics snapshot and a chart image for each channel
-    # metrics snapshot
-    fig_m, axm = plt.subplots(figsize=(8,2))
-    text = 'Metrics snapshot:\\n' + '\\n'.join([f\"{channel_map[c]}: {per_status[c]['value']} ppm ({per_status[c]['status']})\" for c in per_status])
-    axm.text(0.01,0.5, text, fontsize=12)
-    axm.axis('off')
-    pdf.savefig(fig_m)
-    plt.close(fig_m)
-    # small chart per channel
-    for ch in sorted(df['channel'].unique()):
-        chd = df[df['channel']==ch].set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
-        if chd.empty: 
-            continue
-        figc, axc = plt.subplots(figsize=(8,2))
-        axc.plot(chd.index, chd['gas_level_ppm'])
-        axc.set_title(channel_map.get(ch))
-        pdf.savefig(figc)
-        plt.close(figc)
-buffer.seek(0)
-st.download_button('Download incident report (PDF)', data=buffer, file_name='tppr_report.pdf', mime='application/pdf')
+        st.markdown("Recent readings:")
+        st.dataframe(room_df.tail(15)[['timestamp','ppm']].reset_index(drop=True))
 
-st.markdown('---')
-st.write('Operator acknowledgement log:')
-st.write(st.session_state.get('ack_log', []))
+        if st.button("Acknowledge this room"):
+            name = st.text_input("Operator name for log", key=f"ack_{sel}")
+            st.session_state.sim_history.append({"time": pd.Timestamp.now(), "room": sel, "severity": "ack", "operator": name})
+            st.success("Acknowledged")
+
+# After rendering, if any room has glow color, fade back to default after a short pause
+if any(color in ["#ffb84d","#ff4c4c"] for color in st.session_state.room_colors.values()):
+    time.sleep(1.2)
+    st.session_state.room_colors = ROOM_COLORS.copy()
+    st.experimental_rerun()
