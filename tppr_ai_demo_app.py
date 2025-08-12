@@ -47,8 +47,8 @@ for i, r in enumerate(ROOMS):
     prev = df[df["room"]==r["id"]].tail(2)
     delta = ""
     if len(prev) >= 2:
-        delta = f\"{round(val - prev['ppm'].iloc[0],2)} ppm\"
-    metric_cols[i].metric(label=r["name"], value=f\"{val} ppm\", delta=delta)
+        delta = f"{round(val - prev['ppm'].iloc[0],2)} ppm"
+    metric_cols[i].metric(label=r["name"], value=f"{val} ppm", delta=delta)
 
 st.markdown("---")
 left, center, right = st.columns([1.2, 2.4, 1.4])
@@ -89,7 +89,7 @@ with left:
     st.markdown("**Simulation history** (most recent first)")
     hist = list(reversed(st.session_state.sim_history[-10:]))
     for h in hist:
-        st.write(f\"- {h['time'].strftime('%H:%M:%S')} — {h['room']} — {h['severity']}\")
+        st.write(f"- {h['time'].strftime('%H:%M:%S')} — {h['room']} — {h['severity']}")
 
     st.markdown("---")
     st.write("Tips: Click a room on the 3D floorplan to zoom in and inspect detector predictions. Click again to zoom out.")
@@ -176,7 +176,7 @@ with right:
         room_df = st.session_state.df[st.session_state.df['room']==sel].sort_values('timestamp')
         latest = room_df['ppm'].iloc[-1]
         prev = room_df['ppm'].iloc[-2] if len(room_df)>=2 else latest
-        st.metric(label="Current ppm", value=f\"{latest} ppm\", delta=f\"{round(latest-prev,2)} ppm\")
+        st.metric(label="Current ppm", value=f"{latest} ppm", delta=f"{round(latest-prev,2)} ppm")
         # mini forecast chart using last 20 samples
         recent = room_df['ppm'].dropna().iloc[-20:]
         if len(recent) >= 3:
