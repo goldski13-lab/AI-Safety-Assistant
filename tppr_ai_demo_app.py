@@ -1,242 +1,249 @@
 
-import os
-import time
-import math
+import os, time, io
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from datetime import timedelta
+import soundfile as sf
+import sounddevice as sd
 
-# Auto-refresh every 5 seconds (keeps dashboard "live" for judges)
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=5000, key="auto_refresh")
-except Exception:
-    # If package missing, ignore auto-refresh (app still works)
-    pass
+st.set_page_config(page_title="TPPR AI Assistant — UX Upgrade", layout="wide")
+st.title("🚨 TPPR AI Safety Assistant — UX Upgrade")
 
-st.set_page_config(page_title='TPPR AI Safety Assistant', layout='wide')
-
-st.title("🚨 TPPR AI Safety Assistant")
-st.markdown(
-    """
-    **Purpose:** Demo of an AI layer that augments Honeywell Touchpoint Pro data with anomaly detection,
-    short-term forecasting, alert ranking, and an interactive operator dashboard.
-    """
-)
-
-# Determine CSV path reliably
+# Load or simulate data
 CSV_NAME = "tppr_simulated.csv"
 CSV_PATH = os.path.join(os.path.dirname(__file__), CSV_NAME)
-
-# Load CSV if present, otherwise generate a realistic fallback dataset
 if os.path.exists(CSV_PATH):
     df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
 else:
-    # Fallback synthetic dataset
-    now = pd.Timestamp("2025-08-12 14:00:00")
-    minutes = 240  # 4 hours
+    now = pd.Timestamp.now().floor('min')
+    minutes = 240
     rows = []
-    channels = [
-        {"id": 1, "gas": "CH4", "threshold": 100},
-        {"id": 2, "gas": "H2S", "threshold": 50},
-        {"id": 3, "gas": "CO", "threshold": 200},
-    ]
+    channels = [{"id":1,"gas":"CH4","thr":100},{"id":2,"gas":"H2S","thr":50},{"id":3,"gas":"CO","thr":200}]
     np.random.seed(42)
     for i in range(minutes):
         ts = now + pd.Timedelta(minutes=i)
         for ch in channels:
-            baseline = {"CH4": 25, "H2S": 5, "CO": 2}[ch["gas"]]
-            value = baseline + np.random.normal(0, baseline*0.05)
-            rows.append({
-                "timestamp": ts,
-                "channel": ch["id"],
-                "gas_type": ch["gas"],
-                "gas_level_ppm": round(float(value), 2),
-                "alarm_state": 0,
-                "fault_state": 0,
-                "sensor_status": "OK",
-                "calibration_date": "2025-06-10"
-            })
+            base = {"CH4":25,"H2S":5,"CO":2}[ch["gas"]]
+            val = base + np.random.normal(0, base*0.05)
+            rows.append({"timestamp":ts,"channel":ch["id"],"gas_type":ch["gas"],"gas_level_ppm":round(float(val),2),"alarm_state":0})
     df = pd.DataFrame(rows)
-    # inject a slow ramp leak on CH4 and some spikes for demo
-    def apply_ramp(df, ch_id, start_min, dur, peak):
-        mask = (df['channel']==ch_id)
-        idxs = df[mask].index[start_min:start_min+dur]
-        for i, idx in enumerate(idxs):
-            df.at[idx, 'gas_level_ppm'] += (i/len(idxs))*peak
-    apply_ramp(df, 1, 60, 40, 120)
-    # inject spikes
-    for m in [30, 90, 150]:
+    # inject demo event
+    def ramp(ch_id,start,dur,peak):
+        mask = df['channel']==ch_id
+        idxs = df[mask].index[start:start+dur]
+        for i,idx in enumerate(idxs):
+            df.at[idx,'gas_level_ppm'] += (i/len(idxs))*peak
+    ramp(1,60,40,120)
+    for m in [30,90,150]:
         row = df[(df['channel']==1)].iloc[m:m+1]
         if not row.empty:
             idx = row.index[0]
-            df.at[idx, 'gas_level_ppm'] += 80
-    # set alarm states where threshold exceeded
-    thresholds = {1:100, 2:50, 3:200}
-    for ch_id, thr in thresholds.items():
-        ch_mask = df['channel']==ch_id
-        df.loc[ch_mask & (df['gas_level_ppm'] >= thr), 'alarm_state'] = 1
+            df.at[idx,'gas_level_ppm'] += 80
+    thr = {1:100,2:50,3:200}
+    for ch, t in thr.items():
+        chmask = df['channel']==ch
+        df.loc[chmask & (df['gas_level_ppm']>=t), 'alarm_state'] = 1
 
-# Ensure timestamp dtype
+# Ensure timestamp
 if df['timestamp'].dtype == object:
     df['timestamp'] = pd.to_datetime(df['timestamp'])
 
-# Sidebar controls
-st.sidebar.header("Controls")
-danger_threshold = st.sidebar.slider('Danger threshold (ppm)', min_value=0, max_value=500, value=50, step=1)
-play_live_feed = st.sidebar.button("▶ Start Live Feed Simulation")
-speed = st.sidebar.selectbox("Feed speed (delay sec per step)", [0.1, 0.25, 0.5, 1.0], index=1)
+# Sidebar controls (grouped)
+st.sidebar.header("Display Settings")
+thresholds_global = st.sidebar.slider("Global danger threshold (ppm)", 0, 500, 100)
+accessibility = st.sidebar.checkbox("High-contrast (accessibility) mode", value=False)
+st.sidebar.markdown("**Simulation Controls**")
+play = st.sidebar.button("▶ Start Live Feed")
+speed = st.sidebar.selectbox("Feed speed (s per step)", [0.1,0.25,0.5,1.0], index=1)
 
-# Prepare layout
-col_main, col_side = st.columns([3,1])
+channel_map = {1:"CH4 (methane)", 2:"H2S", 3:"CO"}
+thresholds = {1:100, 2:50, 3:200}
 
-# Alert history initialization
-if 'alert_history' not in st.session_state:
-    st.session_state.alert_history = []
+# Latest per-channel values
+latest = df.groupby('channel').tail(1).set_index('channel')
+channel_latest = {ch: float(latest.loc[ch,'gas_level_ppm']) if ch in latest.index else None for ch in sorted(df['channel'].unique())}
 
-# Current latest readings
-latest_readings = df.tail(1)
-
-# Live AI Alert panel
-with col_side:
-    alert_placeholder = st.empty()
-    numeric_latest = latest_readings.select_dtypes(include=[np.number])
-    is_danger = False
-    if not numeric_latest.empty and (numeric_latest > danger_threshold).any().any():
-        is_danger = True
-        alert_placeholder.error(f"🚨 DANGER: Gas above {danger_threshold} ppm detected!")
+# Compute per-channel status
+per_status = {}
+worst_status = ('safe', 0, None)
+for ch, val in channel_latest.items():
+    thr = thresholds.get(ch, thresholds_global)
+    if val is None:
+        st = ('nodata', 0)
     else:
-        alert_placeholder.success(f"✅ All clear (≤ {danger_threshold} ppm)")
+        pct = val / thr if thr>0 else 0
+        if val >= thr:
+            st = ('critical', pct)
+        elif pct >= 0.75:
+            st = ('warning', pct)
+        else:
+            st = ('safe', pct)
+    per_status[ch] = {'value': val, 'status': st[0], 'pct': round(float(st[1]),2), 'threshold': thr}
+    if st[1] > worst_status[1]:
+        worst_status = (st[0], st[1], ch)
 
-    # Update alert history
-    latest_time = latest_readings['timestamp'].iloc[0] if 'timestamp' in latest_readings else 'Unknown time'
-    if is_danger:
-        st.session_state.alert_history.append(f"🚨 {latest_time} — Gas > {danger_threshold} ppm")
+# Top banner
+overall = worst_status[0]
+if overall == 'critical':
+    st.markdown(f"<div style='background:#ff4c4c;padding:12px;border-radius:8px;color:white'><h2>🚨 CRITICAL — {channel_map.get(worst_status[2])} {per_status[worst_status[2]]['value']} ppm (≥ {per_status[worst_status[2]]['threshold']} ppm)</h2></div>", unsafe_allow_html=True)
+    sound = True
+elif overall == 'warning':
+    st.markdown(f"<div style='background:#ffb84d;padding:12px;border-radius:8px;color:#3a2d0f'><h2>🟠 WARNING — {channel_map.get(worst_status[2])} {per_status[worst_status[2]]['value']} ppm (close to {per_status[worst_status[2]]['threshold']} ppm)</h2></div>", unsafe_allow_html=True)
+    sound = False
+else:
+    st.markdown(f"<div style='background:#d4f0d4;padding:12px;border-radius:8px;color:#0f3a14'><h2>✅ SAFE — All channels within normal range</h2></div>", unsafe_allow_html=True)
+    sound = False
+
+# Play short beep for critical (using embedded WAV bytes if available)
+if overall == 'critical':
+    # generate a short sine beep and provide as downloadable audio and play via st.audio
+    sr = 22050
+    t = np.linspace(0,0.4,int(sr*0.4), False)
+    freq = 880.0
+    sine = 0.5*np.sin(2*np.pi*freq*t)
+    # convert to 16-bit PCM bytes
+    import soundfile as sf, io
+    buf = io.BytesIO()
+    sf.write(buf, sine, sr, format='WAV')
+    buf.seek(0)
+    st.audio(buf.read())
+
+# Per-channel metric cards
+cols = st.columns(len(per_status))
+for i, ch in enumerate(sorted(per_status.keys())):
+    p = per_status[ch]
+    val = p['value'] if p['value'] is not None else '—'
+    label = channel_map.get(ch, str(ch))
+    delta = 0
+    try:
+        # compute delta vs previous 1-min
+        prev = df[(df['channel']==ch)].tail(2)['gas_level_ppm'].iloc[0]
+        delta = round(p['value'] - prev,2) if p['value'] is not None else 0
+    except Exception:
+        delta = 0
+    cols[i].metric(label, f\"{val} ppm\", delta= f\"{delta} ppm\" if delta!=0 else \"—\")
+    # small status text
+    cols[i].markdown(f\"**Status:** {p['status'].upper()} (Threshold {p['threshold']} ppm)\")
+
+# Help / guided tour
+with st.expander(\"Quick guided tour (recommended for non-experts)\", expanded=False):
+    st.write(\"1. Top banner shows immediate overall AI assessment.\\n2. Metric cards show each gas numeric value and trend.\\n3. Charts below show history + predictions.\\n4. Use the slider and live feed to simulate behaviour.\")
+
+# Action guidance box
+if overall in ['critical','warning']:
+    st.markdown(\"### Recommended actions\")
+    if overall == 'critical':
+        st.warning(\"Immediate actions: 1) Evacuate affected area. 2) Isolate main valve. 3) Notify safety officer.\\nPress 'Acknowledge' when done.\")
     else:
-        st.session_state.alert_history.append(f"✅ {latest_time} — Safe")
+        st.info(\"Precautionary actions: Check ventilation, inspect nearby equipment, stand by.\")
+    op = st.text_input(\"Operator name (optional, to log acknowledgement)\", value=\"\")
+    ack = st.button(\"Acknowledge\")
+    if ack:
+        if 'ack_log' not in st.session_state:
+            st.session_state.ack_log = []
+        st.session_state.ack_log.append({'time':pd.Timestamp.now(), 'operator':op, 'status':overall, 'channel': worst_status[2]})
+        st.success(\"Acknowledged and logged.\")
 
-    st.sidebar.title("Alert History (most recent)")
-    for item in reversed(st.session_state.alert_history[-20:]):
-        st.sidebar.write(item)
+# Main plotting area
+st.markdown(\"---\")
+st.subheader(\"Channel trends and forecasts\")
+# choose channels to show
+show = st.multiselect(\"Select channels to display\", options=sorted(df['channel'].unique()), default=sorted(df['channel'].unique()), format_func=lambda x: channel_map.get(x, str(x)))
+display_df = df[df['channel'].isin(show)].copy()
 
-# Main charts area
-with col_main:
-    st.subheader("Channel Readings & Forecasts")
-    channels = sorted(df['channel'].unique())
-    channel_map = {1: "CH4 (methane)", 2: "H2S", 3: "CO"}
-    thresholds = {1:100, 2:50, 3:200}
+# Aggregate for heatmap / alert history visualization
+display_df['hour'] = display_df['timestamp'].dt.floor('H')
+alert_counts = display_df[display_df['alarm_state']==1].groupby(['hour','channel']).size().unstack(fill_value=0)
 
-    # Play live feed if requested
-    if play_live_feed:
-        for i in range(len(df)):
-            snapshot = df.iloc[:i+1].copy()
-            # create small plotting area
-            fig, axs = plt.subplots(len(channels), 1, figsize=(10, 3*len(channels)), sharex=True)
-            forecasts = []
-            for j, ch in enumerate(channels):
-                ch_data = snapshot[snapshot['channel']==ch].copy()
-                ch_data = ch_data.set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
-                series = ch_data['gas_level_ppm']
-                axs[j].plot(series.index, series.values, label='Measured')
-                axs[j].set_ylabel("ppm")
-                # mark TPPR alarms
-                alarm_points = series[series >= thresholds[ch]]
-                if not alarm_points.empty:
-                    axs[j].scatter(alarm_points.index, alarm_points.values, marker='x', color='red', zorder=5)
-                # anomaly detection (simple z-score)
-                is_anom = False
-                if len(series) >= 5:
-                    window = min(12, len(series))
-                    recent = series.iloc[-window:]
-                    mean = recent.mean()
-                    std = recent.std(ddof=0)
-                    if std > 0:
-                        z = (series.iloc[-1] - mean) / std
-                        if abs(z) >= 3.0:
-                            is_anom = True
-                            axs[j].axvline(series.index[-1], color='orange', linestyle='--', alpha=0.6)
-                # forecast: linear fit on last up to 20 samples
-                try:
-                    recent = series.dropna().iloc[-20:]
-                    if len(recent) >= 3:
-                        x = np.arange(len(recent))
-                        y = recent.values.astype(float)
-                        coef = np.polyfit(x, y, 1)
-                        m, b = coef[0], coef[1]
-                        future_x = np.arange(len(recent), len(recent)+5)
-                        future_y = m*future_x + b
-                        last_time = series.index[-1]
-                        future_index = [last_time + pd.Timedelta(minutes=int(k)) for k in range(1,6)]
-                        axs[j].plot(future_index, future_y, linestyle='--', marker='o', label='Predicted')
-                        forecasts.append((ch, channel_map.get(ch, str(ch)), future_index, future_y))
-                except Exception:
-                    pass
-                axs[j].legend(loc='upper left')
-            st.pyplot(fig)
-            # show forecast table if available
-            if forecasts:
-                rows = []
-                for f in forecasts:
-                    for t, v in zip(f[2], f[3]):
-                        rows.append({'channel': f[0], 'gas': f[1], 'pred_time': t, 'pred_ppm': round(float(v),2)})
-                st.write("**Short-term per-channel forecast (next 5 minutes)**")
-                st.dataframe(pd.DataFrame(rows))
-            time.sleep(speed)
-        st.experimental_rerun()
+# Heatmap of alerts per hour
+st.markdown(\"#### Alert heatmap (alerts per hour)\")
+if not alert_counts.empty:
+    fig_h, axh = plt.subplots(figsize=(8,2))
+    im = axh.imshow(alert_counts.T, aspect='auto', cmap='Reds')
+    axh.set_yticks(np.arange(len(alert_counts.columns)))
+    axh.set_yticklabels([channel_map.get(c) for c in alert_counts.columns])
+    axh.set_xticks(np.arange(len(alert_counts.index)))
+    axh.set_xticklabels([t.strftime('%H:%M') for t in alert_counts.index], rotation=45)
+    plt.tight_layout()
+    st.pyplot(fig_h)
+else:
+    st.write(\"No alarms in selected range.\")
 
-    # Non-playback (static view of latest snapshot)
-    snapshot = df.copy()
-    latest_snapshot = snapshot.tail(len(channels)*4)  # recent chunk
-    fig, axs = plt.subplots(len(channels), 1, figsize=(10, 3*len(channels)), sharex=True)
-    forecasts = []
-    for j, ch in enumerate(channels):
-        ch_data = snapshot[snapshot['channel']==ch].copy()
-        ch_data = ch_data.set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
-        series = ch_data['gas_level_ppm']
-        axs[j].plot(series.index, series.values, label='Measured')
-        axs[j].set_ylabel("ppm")
-        alarm_points = series[series >= thresholds[ch]]
-        if not alarm_points.empty:
-            axs[j].scatter(alarm_points.index, alarm_points.values, marker='x', color='red', zorder=5)
-        # anomaly detection
-        if len(series) >= 5:
-            window = min(12, len(series))
-            recent = series.iloc[-window:]
-            mean = recent.mean()
-            std = recent.std(ddof=0)
-            if std > 0:
-                z = (series.iloc[-1] - mean) / std
-                if abs(z) >= 3.0:
-                    axs[j].axvline(series.index[-1], color='orange', linestyle='--', alpha=0.6)
-        # forecast per-channel
-        try:
-            recent = series.dropna().iloc[-20:]
-            if len(recent) >= 3:
-                x = np.arange(len(recent))
-                y = recent.values.astype(float)
-                coef = np.polyfit(x, y, 1)
-                m, b = coef[0], coef[1]
-                future_x = np.arange(len(recent), len(recent)+5)
-                future_y = m*future_x + b
-                last_time = series.index[-1]
-                future_index = [last_time + pd.Timedelta(minutes=int(k)) for k in range(1,6)]
-                axs[j].plot(future_index, future_y, linestyle='--', marker='o', label='Predicted')
-                forecasts.append((ch, channel_map.get(ch, str(ch)), future_index, future_y))
-        except Exception:
-            pass
-        axs[j].legend(loc='upper left')
+# For each channel, plot recent trend and short forecast
+for ch in show:
+    ch_data = display_df[display_df['channel']==ch].set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
+    if ch_data.empty:
+        continue
+    series = ch_data['gas_level_ppm']
+    fig, ax = plt.subplots(figsize=(8,2.5))
+    ax.plot(series.index, series.values, label='Measured')
+    # shaded zones
+    thr = thresholds.get(ch, thresholds_global)
+    ax.fill_between(series.index, thr*0.75, thr, color='orange', alpha=0.1, label='Warning zone')
+    ax.fill_between(series.index, thr, thr*2, color='red', alpha=0.06, label='Critical zone')
+    # anomaly markers
+    if len(series) >= 5:
+        window = min(12, len(series))
+        recent = series.iloc[-window:]
+        m = recent.mean(); s = recent.std(ddof=0)
+        if s > 0 and abs(series.iloc[-1]-m)/s >= 3.0:
+            ax.axvline(series.index[-1], color='purple', linestyle='--', label='Anomaly')
+    # forecast linear
+    try:
+        recent = series.dropna().iloc[-20:]
+        if len(recent) >= 3:
+            x = np.arange(len(recent)); y = recent.values.astype(float)
+            coef = np.polyfit(x,y,1); m,b = coef[0],coef[1]
+            future_x = np.arange(len(recent), len(recent)+5)
+            future_y = m*future_x + b
+            last_t = series.index[-1]
+            future_idx = [last_t + pd.Timedelta(minutes=int(k)) for k in range(1,6)]
+            ax.plot(future_idx, future_y, linestyle='--', marker='o', label='Predicted')
+            # calculate minutes to threshold estimate
+            if m>0:
+                mins_to_thr = (thresholds.get(ch, thresholds_global) - series.iloc[-1]) / m
+            else:
+                mins_to_thr = None
+        else:
+            mins_to_thr = None
+    except Exception:
+        mins_to_thr = None
+    ax.set_title(f\"{channel_map.get(ch)} — {series.iloc[-1]:.1f} ppm\" )
+    ax.set_ylabel('ppm')
+    ax.legend(loc='upper left', fontsize=8)
     st.pyplot(fig)
-    if forecasts:
-        rows = []
-        for f in forecasts:
-            for t, v in zip(f[2], f[3]):
-                rows.append({'channel': f[0], 'gas': f[1], 'pred_time': t, 'pred_ppm': round(float(v),2)})
-        st.write("**Short-term per-channel forecast (next 5 minutes)**")
-        st.dataframe(pd.DataFrame(rows))
+    if mins_to_thr is not None and mins_to_thr>0 and mins_to_thr<9999:
+        st.write(f\"Estimated time to threshold: ~{max(0,int(round(mins_to_thr)))} minutes (approx)\")
 
-# Footer / notes
-st.markdown("---")
-st.markdown("**Notes:** This demo runs with a simulated dataset if a CSV isn't present. For full integration,"
-            " TPPR would stream Modbus/RS-485 or Modbus/TCP data to the AI unit which would run the same"
-            " analytics shown here.")
+# Export PDF report of current figures & alert history
+st.markdown('---')
+st.subheader('Export / Report')
+buffer = io.BytesIO()
+with PdfPages(buffer) as pdf:
+    # simple: write a page with metrics snapshot and a chart image for each channel
+    # metrics snapshot
+    fig_m, axm = plt.subplots(figsize=(8,2))
+    text = 'Metrics snapshot:\\n' + '\\n'.join([f\"{channel_map[c]}: {per_status[c]['value']} ppm ({per_status[c]['status']})\" for c in per_status])
+    axm.text(0.01,0.5, text, fontsize=12)
+    axm.axis('off')
+    pdf.savefig(fig_m)
+    plt.close(fig_m)
+    # small chart per channel
+    for ch in sorted(df['channel'].unique()):
+        chd = df[df['channel']==ch].set_index('timestamp').resample('1T').mean(numeric_only=True).ffill()
+        if chd.empty: 
+            continue
+        figc, axc = plt.subplots(figsize=(8,2))
+        axc.plot(chd.index, chd['gas_level_ppm'])
+        axc.set_title(channel_map.get(ch))
+        pdf.savefig(figc)
+        plt.close(figc)
+buffer.seek(0)
+st.download_button('Download incident report (PDF)', data=buffer, file_name='tppr_report.pdf', mime='application/pdf')
+
+st.markdown('---')
+st.write('Operator acknowledgement log:')
+st.write(st.session_state.get('ack_log', []))
